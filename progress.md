@@ -63,3 +63,23 @@
 **Status:** Phase 2 training script and environment requirements are defined. Local execution is blocked by hardware limitations. Cloud environment strategy is determined.
 
 **Next Step:** Provision a cloud GPU instance using the `PyTorch (Vast)` template, set up the environment, and execute the `train_entangled.py` script to begin QLoRA fine-tuning. 
+
+## 2024-07-29: Phase 2 - Execution & Debugging
+
+1.  **Environment Setup:** Provisioned cloud GPU instance (Vast.ai, PyTorch template).
+2.  **Initial Run & Auth:** Encountered Hugging Face gated repo error (`401 Client Error`). Resolved by logging in via `huggingface-cli login`.
+3.  **TensorBoard Dependency:** Encountered `RuntimeError` due to missing `tensorboard`. Resolved by adding `tensorboard` to `phase2_training/requirements.txt` and installing it (`pip install tensorboard`).
+4.  **Dataset Column Mismatch:** Encountered `ValueError` (`No columns in the dataset match the model's forward method signature`). Resolved by adding a preprocessing step in `train_entangled.py` to tokenize the `text` column into `input_ids` and `attention_mask` using `dataset.map()`.
+5.  **Trainer Argument Mismatch:** Encountered `TypeError` (`compute_loss() got an unexpected keyword argument 'num_items_in_batch'`). Resolved by updating the `EntangledTrainer.compute_loss` signature to accept `**kwargs`.
+6.  **Bitsandbytes Quantization Conflict:** Encountered `AssertionError` (`assert module.weight.shape[1] == 1`) within `bitsandbytes` when processing custom layers (`variational_head`). 
+    *   **Attempt 1:** Explicitly setting device/dtype of custom layers *after* `from_pretrained`. Failed.
+    *   **Attempt 2:** Refactored `EntangledLlama` into a wrapper class (`nn.Module`) around a PEFT-quantized base model. Modified loading logic accordingly. Resolved the `AssertionError`.
+7.  **Disk Space Error (Checkpointing):** Encountered `safetensors_rust.SafetensorError` (`No space left on device`) during automatic checkpoint saving by the `Trainer`.
+    *   **Attempt 1:** Setting `save_strategy="no"`. Failed (Trainer still attempted final save).
+    *   **Attempt 2:** Setting `save_strategy="steps"` and `save_steps=9999` (greater than `max_steps=10`). Resolved the saving error during `trainer.train()`.
+8.  **Temporary Directory Error:** Encountered `FileNotFoundError: [Errno 2] No usable temporary directory found`. This is an environment issue on the current instance.
+    *   **Attempt 1:** Setting `TMPDIR=/workspace/sorya/tmp_files`. Still failed, suggesting potential permission or deeper filesystem issues on the instance.
+
+**Status:** Training script `train_entangled.py` is debugged and runnable, successfully completing 10 steps. Blocked by environment issue (`FileNotFoundError: No usable temporary directory found`) on the current cloud instance.
+
+**Next Step:** Destroy current instance. Provision a new cloud GPU instance with significantly more disk space. Clone the repository, set up the environment (create venv, install requirements), potentially set `TMPDIR` if needed on the new instance, and run `python phase2_training/train_entangled.py`. 

@@ -6,3 +6,4 @@ bitsandbytes>=0.41.0
 accelerate>=0.25.0
 datasets>=2.16.0
 # Add other dependencies as needed, e.g., wandb
+tensorboard
