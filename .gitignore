@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+env/
+
+# Large model files & Data
+*.gguf
+*.bin
+*.pt
+*.pth
+*.safetensors
+data/
+datasets/
+outputs/
+results/
+checkpoints/
+models/
+
+Wc.bin
+llama-2-7b-chat.Q5_K_M.gguf
+# Build artifacts (e.g., from C++ compilation)
+build/
+bin/
+*.o
+*.so
+*.dylib
+*.dll
+
+# IDE / Editor specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets
+.env 
