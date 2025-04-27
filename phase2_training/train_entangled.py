@@ -14,7 +14,6 @@ from transformers import (
     Trainer,
 )
 from peft import LoraConfig, get_peft_model, TaskType
-from trl import SFTTrainer
 from typing import Optional, Tuple, List, Union
 from dataclasses import dataclass
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -44,27 +43,12 @@ class EntangledCausalLMOutput(CausalLMOutputWithPast):
     kl_loss: Optional[torch.FloatTensor] = None
 
 
-# --- Modified EntangledLlama Class ---
-class EntangledLlama(LlamaForCausalLM):
-    def __init__(self, config, commitment_dim=64):
-        super().__init__(config)
-        self.commitment_dim = commitment_dim
-        hidden_size = config.hidden_size
-
-        # Define the Variational Head (q_phi)
-        self.variational_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, 2 * self.commitment_dim)
-        )
-
-        # --- Add Commitment Projection Layer (W_c) ---
-        # This layer projects the commitment vector z* to the model's hidden dimension
-        self.Wc_projection = nn.Linear(self.commitment_dim, hidden_size, bias=False)
-
-    # TODO: Add commitment projection (W_c) using LoRA or similar (affects forward pass)
-
-    # Modified forward signature and return type
+# --- Modified EntangledLlama Class (Becomes mostly standard Llama) ---
+# We remove the custom head and projection from here. The wrapper will handle them.
+class BaseLlamaForEntanglement(LlamaForCausalLM):
+    # No custom __init__ needed anymore, inherits directly
+    # Keep the modified forward signature ONLY to potentially force output_hidden_states
+    # if the wrapper needs them, but remove all entanglement logic.
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -77,20 +61,12 @@ class EntangledLlama(LlamaForCausalLM):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        calculate_entanglement: bool = False, # Flag to enable z* calculation
-        commitment_lambda: float = 1.0, # Strength of commitment addition
-        kl_beta: float = 0.1, # Hyperparameter for KL divergence weight (example value)
-    ) -> Union[Tuple, EntangledCausalLMOutput]: # Return either tuple or custom output
+        # Remove entanglement-specific args from base model forward
+    ) -> Union[Tuple, CausalLMOutputWithPast]: # Return standard output
 
-        # Ensure hidden states are output if calculating entanglement
-        # Also force return_dict for easier access to named outputs
-        original_output_hidden_states = output_hidden_states
-        if calculate_entanglement or (commitment_lambda > 0):
-            output_hidden_states = True
-            if commitment_lambda > 0 or calculate_entanglement: # Need dict if calculating KL loss too
-                 return_dict = True
-
-        # --- Call Base Model Forward Pass ---
+        # --- Call Base Model Forward Pass (Standard Llama) ---
+        # Force output_hidden_states=True if needed externally?
+        # Or just let the caller request it.
         outputs = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -100,116 +76,211 @@ class EntangledLlama(LlamaForCausalLM):
             labels=labels,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states, # Use potentially modified flag
-            return_dict=return_dict, # Use potentially modified flag
+            output_hidden_states=output_hidden_states, # Pass through request
+            return_dict=return_dict, # Pass through request
+        )
+        return outputs
+
+# --- EntangledModel Wrapper (Full Forward Pass Restored) --- 
+class EntangledModel(nn.Module):
+    def __init__(self, base_model, commitment_dim=64):
+        super().__init__()
+        self.base_model = base_model
+        self.commitment_dim = commitment_dim
+        # Use the config from the base model to get hidden_size
+        hidden_size = base_model.config.hidden_size 
+
+        # Define the Variational Head (q_phi)
+        self.variational_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 2 * self.commitment_dim)
         )
 
-        # --- Calculate Entanglement Variables (if requested) ---
+        # --- Add Commitment Projection Layer (W_c) ---
+        self.Wc_projection = nn.Linear(self.commitment_dim, hidden_size, bias=False)
+
+        # Ensure these custom layers use the same compute dtype as the base model if possible
+        compute_dtype = getattr(base_model.config, "torch_dtype", torch.float32)
+        if compute_dtype == torch.float16 or compute_dtype == torch.bfloat16:
+            self.variational_head.to(dtype=compute_dtype)
+            self.Wc_projection.to(dtype=compute_dtype)
+
+    # --- FULL FORWARD PASS --- 
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        # Add other necessary args passed by Trainer (position_ids etc.)
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        calculate_entanglement: bool = True, 
+        commitment_lambda: float = 1.0, 
+    ) -> EntangledCausalLMOutput: 
+        # --- Remove most verbose prints --- 
+        # print(f">>> [Step Start] ...", flush=True)
+
+        # print(">>> [Step] Calling base_model forward...", flush=True)
+        base_outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=None, 
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=True, 
+            return_dict=True, 
+        )
+        # print(">>> [Step] base_model forward complete.", flush=True)
+
+        # --- Calculate Entanglement Variables --- 
         z_star, mu, logvar = None, None, None
-        projected_commitment = None # To store Wc * z_star
-        sequence_lengths = None # Store sequence lengths for commitment addition
-        kl_loss = None # Initialize KL loss
-        if calculate_entanglement and outputs.hidden_states is not None:
-            # 1. Get hidden state at decisive timestep (use last token of input sequence)
-            if input_ids is not None:
-                # Determine sequence lengths (index of last non-padding token)
-                if attention_mask is not None:
-                    # Use attention mask to find the length reliably
-                    sequence_lengths = attention_mask.sum(dim=1) - 1
-                else:
-                    # Fallback: assume no padding if no mask provided
-                    # Warning: This might be inaccurate if padding exists without mask
-                    sequence_lengths = (input_ids.shape[1] - 1)
-                    if torch.any(input_ids == 0): # Basic check for padding token
-                         logging.warning("Input IDs seem to contain padding, but no attention mask provided. Assuming full sequence length.")
-
-                # Get hidden state from the last layer
-                last_hidden_state = outputs.hidden_states[-1] # Shape: (batch_size, seq_len, hidden_size)
-
-                # Gather hidden states at the end of each sequence in the batch
-                batch_size = last_hidden_state.shape[0]
-                # Create indices tensor for gathering: (batch_size, 1, hidden_size)
-                # Clamp indices to be within valid range just in case
-                indices = sequence_lengths.clamp(0, last_hidden_state.shape[1] - 1).view(batch_size, 1, 1).expand(-1, -1, last_hidden_state.shape[-1])
-                decisive_h = last_hidden_state.gather(1, indices).squeeze(1) # Shape: (batch_size, hidden_size)
-
-                # 2. Pass through variational head
-                mu_logvar = self.variational_head(decisive_h) # Shape: (batch_size, 2 * commitment_dim)
-                mu = mu_logvar[:, :self.commitment_dim]
-                logvar = mu_logvar[:, self.commitment_dim:]
-
-                # 3. Reparameterization Trick to sample z_star
-                std = torch.exp(0.5 * logvar)
-                eps = torch.randn_like(std)
-                z_star = mu + eps * std
-
-                # --- Project z_star using W_c ---
-                projected_commitment = self.Wc_projection(z_star) # Shape: (batch_size, hidden_size)
-
-                # --- Calculate KL Divergence ---
-                # KL divergence between q_phi(z|h) and p(z) = N(0, I)
-                # Formula: -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-                # Here, logvar = log(sigma^2)
-                kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1) # Sum over commitment dim
-                kl_loss = kl_loss.mean() # Average over batch
-
+        projected_commitment = None
+        sequence_lengths = None
+        kl_loss = None
+        # --- Initialize decisive_h --- 
+        decisive_h = None 
+        # --- Calculate decisive_h only if input_ids are present --- 
+        if input_ids is not None:
+            # print(">>> [DEBUG] Calculating decisive_h from input_ids...")
+            if attention_mask is not None:
+                sequence_lengths = attention_mask.sum(dim=1) - 1
             else:
-                logging.warning("Cannot calculate entanglement: input_ids not provided.")
+                sequence_lengths = torch.tensor([input_ids.shape[1] - 1] * input_ids.shape[0], device=input_ids.device)
+                if torch.any(input_ids == 0):
+                     logging.warning("Input IDs seem to contain padding... Ensure attention_mask is correct.")
+            
+            last_hidden_state = base_outputs.hidden_states[-1]
+            batch_size = last_hidden_state.shape[0]
+            indices = sequence_lengths.clamp(0, last_hidden_state.shape[1] - 1).view(batch_size, 1, 1).expand(-1, -1, last_hidden_state.shape[-1])
+            indices = indices.to(last_hidden_state.device)
+            decisive_h = last_hidden_state.gather(1, indices).squeeze(1)
+            # print(f">>> [DEBUG] decisive_h calculated, shape: {decisive_h.shape}")
+        # --- End of block for calculating decisive_h ---
 
+        # --- Calculate variational head outputs ONLY if decisive_h exists --- 
+        if decisive_h is not None:
+            # print(">>> [DEBUG] Calculating variational head outputs...")
+            self.variational_head.to(decisive_h.device)
+            mu_logvar = self.variational_head(decisive_h)
+            # print(f">>> [DEBUG KL Calc] type(mu_logvar)={type(mu_logvar)}, mu_logvar.shape={mu_logvar.shape if torch.is_tensor(mu_logvar) else 'N/A'}", flush=True)
+            mu = mu_logvar[:, :self.commitment_dim]
+            logvar = mu_logvar[:, self.commitment_dim:]
+            # print(f">>> [DEBUG KL Calc] type(mu)={type(mu)}, type(logvar)={type(logvar)}", flush=True)
+            if torch.is_tensor(logvar):
+                print(f">>> [DEBUG KL Calc] logvar.shape={logvar.shape}", flush=True)
+            else:
+                print(f">>> [DEBUG KL Calc] logvar is NOT a tensor (or is None)! Value: {logvar}", flush=True)
+
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            z_star = mu + eps * std
+
+            self.Wc_projection.to(z_star.device)
+            projected_commitment = self.Wc_projection(z_star)
+
+            # --- Calculate KL Divergence (only if mu/logvar calculated) --- 
+            # print(">>> [DEBUG] Calculating KL loss...")
+            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+            kl_loss = kl_loss.mean()
+            # print(f">>> [Step] Entanglement variables calculated. KL Loss: {kl_loss.item():.4f}", flush=True)
+        else:
+            # This case occurs if input_ids were None (e.g., inputs_embeds used)
+            # or if base_outputs.hidden_states was None
+            print(">>> [DEBUG] Skipping variational head calculation (decisive_h is None).", flush=True)
 
         # --- Commitment Addition Logic ---
-        final_logits = outputs.logits # Start with original logits
-        if commitment_lambda > 0 and projected_commitment is not None and outputs.hidden_states is not None and sequence_lengths is not None:
-            last_hidden_state = outputs.hidden_states[-1] # Shape: (batch_size, seq_len, hidden_size)
+        final_logits = base_outputs.logits
+        # --- ADD SHAPE PRINT --- 
+        print(f">>> [DEBUG Shape Check] Before commitment: base_outputs.logits shape = {base_outputs.logits.shape}", flush=True)
+        # --- 
+        if commitment_lambda > 0 and projected_commitment is not None and base_outputs.hidden_states is not None and sequence_lengths is not None:
+            # print(">>> [Step] Applying commitment vector...", flush=True)
+            last_hidden_state = base_outputs.hidden_states[-1]
             batch_size, seq_len, hidden_size = last_hidden_state.shape
-
-            # Create a mask for positions *after* the decisive turn
-            # Mask should be 1 for positions > sequence_length, 0 otherwise
-            pos_indices = torch.arange(seq_len, device=last_hidden_state.device)[None, :] # Shape: (1, seq_len)
-            # sequence_lengths[:, None] gives shape (batch_size, 1)
-            commitment_mask = (pos_indices > sequence_lengths[:, None]).float() # Shape: (batch_size, seq_len)
-            commitment_mask = commitment_mask.unsqueeze(-1) # Shape: (batch_size, seq_len, 1)
-
-            # Add scaled projected commitment to the last hidden state, applying the mask
-            # projected_commitment shape: (batch_size, hidden_size) -> unsqueeze to (batch_size, 1, hidden_size) for broadcasting
+            pos_indices = torch.arange(seq_len, device=last_hidden_state.device)[None, :]
+            commitment_mask = (pos_indices > sequence_lengths[:, None]).float()
+            commitment_mask = commitment_mask.unsqueeze(-1)
+            
+            projected_commitment = projected_commitment.to(last_hidden_state.device)
+            # --- Corrected multiplication --- 
             modified_last_hidden_state = last_hidden_state + (
-                projected_commitment.unsqueeze(1) * commitment_lambda * commitment_mask
+                projected_commitment.unsqueeze(1) * commitment_lambda * commitment_mask # Use commitment_mask
             )
+            # --- 
+            # print(f">>> [DEBUG Shape Check] Before lm_head: modified_last_hidden_state shape = {modified_last_hidden_state.shape}", flush=True)
+            
+            final_logits = self.base_model.lm_head(modified_last_hidden_state)
+            # print(f">>> [DEBUG Shape Check] After lm_head: final_logits shape = {final_logits.shape}", flush=True)
+        # elif commitment_lambda > 0:
+        #      print(">>> [Step] Skipping commitment addition (conditions not met).", flush=True)
 
-            # Recalculate logits using the modified hidden state
-            final_logits = self.lm_head(modified_last_hidden_state)
-
-
-        # --- Handle Return Value ---
-        if not return_dict:
-             # If tuple was requested originally, try to reconstruct, otherwise return base output
-             # This gets complicated, strongly recommend using return_dict=True when using entanglement
-             logging.warning("Returning tuple output for EntangledLlama is complex; dict output recommended.")
-             # Simplest fallback: return modified logits if calculated, else base logits/outputs
-             if commitment_lambda > 0 and projected_commitment is not None:
-                 # This won't match the standard tuple format perfectly
-                 return (final_logits,) + outputs[1:] # Replace original logits
-             else:
-                 return outputs # Return original tuple/dict from base
-
-        # If we calculated entanglement, return the custom dataclass
-        if calculate_entanglement:
-            return EntangledCausalLMOutput(
-                loss=outputs.loss,
-                logits=final_logits,
-                past_key_values=outputs.past_key_values,
-                # Only include hidden_states/attentions if originally requested OR calculated for entanglement
-                hidden_states=outputs.hidden_states if (original_output_hidden_states or calculate_entanglement or (commitment_lambda > 0)) else None,
-                attentions=outputs.attentions,
-                z_star=z_star,
-                mu=mu,
-                logvar=logvar,
-                kl_loss=kl_loss,
-            )
+        # --- Calculate Loss (if labels provided) ---
+        loss = None
+        if labels is not None:
+            print(">>> [Step] Calculating loss...", flush=True)
+            # --- ADD SHAPE PRINT for final_logits --- 
+            print(f">>> [DEBUG Loss Calc] Entering loss calc: final_logits shape={final_logits.shape}", flush=True)
+            # --- END SHAPE PRINT --- 
+            shift_logits = final_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # --- ADD SHAPE PRINTS --- 
+            print(f">>> [DEBUG Loss Calc] Before view: shift_logits shape={shift_logits.shape}, shift_labels shape={shift_labels.shape}", flush=True)
+            # --- END SHAPE PRINTS --- 
+            # --- ENSURE loss_fct is defined HERE --- 
+            loss_fct = nn.CrossEntropyLoss() # Ensure definition is present
+            # --- 
+            shift_logits = shift_logits.view(-1, self.base_model.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # --- ADD SHAPE PRINTS --- 
+            print(f">>> [DEBUG Loss Calc] After view: shift_logits shape={shift_logits.shape}, shift_labels shape={shift_labels.shape}", flush=True)
+            # --- END SHAPE PRINTS --- 
+            # --- ADD DEBUG PRINTS --- 
+            print(f">>> [DEBUG Loss Calc] Before .to(): type(shift_labels)={type(shift_labels)}, type(shift_logits)={type(shift_logits)}", flush=True)
+            if torch.is_tensor(shift_logits):
+                 print(f">>> [DEBUG Loss Calc] shift_logits.device = {shift_logits.device}", flush=True)
+            else:
+                 print(f">>> [DEBUG Loss Calc] shift_logits is NOT a tensor!", flush=True)
+            if 'shift_labels' in locals():
+                 print(f">>> [DEBUG Loss Calc] shift_labels exists.", flush=True)
+            else:
+                 print(f">>> [DEBUG Loss Calc] shift_labels does NOT exist!", flush=True)
+            # --- END DEBUG PRINTS --- 
+            shift_labels = shift_labels.to(shift_logits.device)
+            # Calculate loss
+            loss = loss_fct(shift_logits, shift_labels)
+            # Print loss info
+            print(f">>> [Step] Loss calculated. Value: {loss}, Type: {type(loss)}", flush=True)
+            if torch.is_tensor(loss):
+                try:
+                    print(f">>> [Step] Loss item: {loss.item()}", flush=True)
+                except Exception as e_item:
+                    print(f">>> [Step] Error getting loss.item(): {e_item}", flush=True)
+            elif loss is None:
+                 print(">>> [Step] Calculated loss is None!", flush=True)
         else:
-            # If dict was requested, but entanglement wasn't calculated, return standard dict output
-            return outputs
+            print(">>> [Step] Skipping loss calculation (no labels).", flush=True)
 
+        # --- Return Custom Output Dataclass --- 
+        # print(">>> [Step End] EntangledModel forward pass complete.", flush=True)
+        return EntangledCausalLMOutput(
+            loss=loss, 
+            logits=final_logits,
+            past_key_values=base_outputs.past_key_values,
+            hidden_states=base_outputs.hidden_states,
+            attentions=base_outputs.attentions,
+            z_star=z_star,
+            mu=mu,
+            logvar=logvar,
+            kl_loss=kl_loss,
+        )
+    # --- END FULL FORWARD --- 
 
 # --- PEFT Configuration ---
 # Example LoRA configuration for general fine-tuning
@@ -224,142 +295,251 @@ lora_config = LoraConfig(
 )
 
 
-# --- Custom Trainer for Combined Loss ---
-class EntangledTrainer(Trainer):
-    def __init__(self, *args, kl_beta=0.1, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.kl_beta = kl_beta # Store the KL divergence weight
+# --- Custom Trainer (Keep COMMENTED OUT) ---
+# class EntangledTrainer(Trainer):
+#     # Keep __init__ as is, kl_beta won't be used in this test
+#     def __init__(self, *args, kl_beta=0.1, **kwargs):
+#         super().__init__(*args, **kwargs)
+#         self.kl_beta = kl_beta 
 
-    def compute_loss(self, model, inputs, return_outputs=False):
-        """
-        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+#     # --- MODIFIED compute_loss for DEBUGGING --- 
+#     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+#         """
+#         DEBUG: Compute loss using ONLY the standard output from the minimal model.
+#         """
+#         # The model forward pass is the minimal one returning standard outputs
+#         outputs = model(**inputs)
 
-        Subclass and override for custom behavior.
-        """
-        # Ensure the model calculates entanglement variables and returns the custom dict
-        # Pass relevant args from init or state if needed inside the model's forward
-        outputs = model(**inputs, calculate_entanglement=True, kl_beta=self.kl_beta)
+#         # Extract the standard LM loss ONLY
+#         lm_loss = outputs.loss
+#         
+#         # IGNORE KL loss for this test
+#         # kl_loss = outputs.kl_loss 
 
-        # Extract the standard LM loss (calculated by the base model on original/modified logits)
-        lm_loss = outputs.loss
+#         # Combine the losses (only lm_loss here)
+#         if lm_loss is not None:
+#             total_loss = lm_loss
+#         else:
+#             logging.error("LM loss not found in model outputs.")
+#             total_loss = None
+#         
+#         # Print the loss being returned for debugging
+#         print(f">>> [DEBUG EntangledTrainer] compute_loss returning: {total_loss.item() if total_loss is not None else 'None'}", flush=True)
 
-        # Extract the KL loss calculated in our custom forward pass
-        kl_loss = outputs.kl_loss
-
-        # Combine the losses
-        # Ensure kl_loss is valid before adding
-        if lm_loss is not None and kl_loss is not None:
-            total_loss = lm_loss + self.kl_beta * kl_loss
-        elif lm_loss is not None:
-            total_loss = lm_loss # Fallback to only LM loss if KL wasn't calculated
-            logging.warning("KL loss not found in model outputs, using only LM loss.")
-        else:
-            # This should generally not happen if labels are provided
-            logging.error("LM loss not found in model outputs.")
-            total_loss = None # Or handle error appropriately
-
-        return (total_loss, outputs) if return_outputs else total_loss
-
+#         return (total_loss, outputs) if return_outputs else total_loss
+#     # --- END MODIFIED compute_loss ---
 
 if __name__ == "__main__":
     # --- Configuration ---
     model_name = "meta-llama/Llama-2-7b-chat-hf"
-    # Use a smaller subset for faster testing initially
-    # dataset_name = "mlabonne/guanaco-llama2-1k"
-    dataset_name = "mlabonne/guanaco-llama2-1k" # Full dataset for example
+    dataset_name = "databricks/databricks-dolly-15k"
     commitment_dim = 64
-    output_dir = "./results_phase2"
-    kl_beta_value = 0.1 # Example value for KL loss weight
+    output_dir = "./results_phase2_dolly"
+    kl_beta_value = 0.1
 
     # --- Load Tokenizer ---
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token # Set pad token for batched training
-    tokenizer.padding_side = "right" # Llama requires right padding
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
 
-    # --- Load Dataset ---
+    # --- Dataset Loading and Preprocessing (Adapted for Dolly) --- 
+    # Define a formatting function for the Dolly dataset
+    def format_dolly(sample):
+        instruction = sample["instruction"]
+        context = sample["context"]
+        response = sample["response"]
+        # Create a prompt string similar to Alpaca format
+        if context:
+            prompt = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Input:\n{context}\n\n### Response:\n{response}"""
+        else:
+            prompt = f"""Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:\n{response}"""
+        # Add EOS token needed for generation separation, but it might interfere with training if labels are just input_ids
+        # Let's return just the formatted prompt for now. SFTTrainer or manual loss handles shifting.
+        return prompt # + tokenizer.eos_token 
+
+    def preprocess_function(examples, tokenizer):
+        # examples is a dictionary where keys are column names ('instruction', 'context', 'response')
+        # and values are lists of strings.
+        
+        formatted_texts = []
+        # Iterate through the batch index
+        for i in range(len(examples["instruction"])):
+            # Reconstruct a sample dictionary for each item in the batch
+            sample = {
+                "instruction": examples["instruction"][i],
+                "context": examples["context"][i],
+                "response": examples["response"][i]
+            }
+            formatted_texts.append(format_dolly(sample))
+            
+        # Then tokenize the formatted texts
+        tokenized_inputs = tokenizer(formatted_texts, truncation=True, padding="max_length", max_length=512) # Keep max_length for now
+        # Set labels as input_ids
+        tokenized_inputs["labels"] = tokenized_inputs["input_ids"].copy()
+        return tokenized_inputs
+
     print(f"Loading dataset: {dataset_name}")
-    # Load a portion for testing, use full later
-    # dataset = load_dataset(dataset_name, split="train[:100]") # Load first 100 samples
-    dataset = load_dataset(dataset_name, split="train") # Load full training set
-    # TODO: Add preprocessing if needed (e.g., formatting, tokenization)
-    # TRL's SFTTrainer often handles formatting, but check requirements
+    # Dolly dataset doesn't have pre-defined splits, load all and potentially split later if needed
+    dataset = load_dataset(dataset_name)["train"] # Dolly only has a 'train' split 
     print(f"Dataset loaded. Size: {len(dataset)}")
+    print("Preprocessing dataset...") 
+    tokenized_dataset = dataset.map( 
+        lambda examples: preprocess_function(examples, tokenizer),
+        batched=True,
+        remove_columns=["instruction", "context", "response", "category"] # Remove original Dolly columns
+    )
+    print("Dataset preprocessed.") 
 
-
-    # --- Model Loading (QLoRA Example) ---
+    # --- Model Loading (QLoRA Base, try multi-GPU) --- 
     print(f"Loading base model: {model_name}")
-    config = AutoConfig.from_pretrained(model_name)
-    # Instantiate our custom model (example for QLoRA)
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16, # Use bfloat16 for A100/H100
+        bnb_4bit_compute_dtype=torch.bfloat16, 
         bnb_4bit_use_double_quant=False,
     )
-    entangled_model = EntangledLlama.from_pretrained(
+    base_model = LlamaForCausalLM.from_pretrained(
         model_name,
-        config=config,
-        commitment_dim=commitment_dim,
-        quantization_config=bnb_config, # Apply QLoRA quantization - RE-ENABLED
-        device_map="auto", # Automatically distribute model layers
+        quantization_config=bnb_config,
+        # device_map="auto", # REMOVED: Let Accelerator handle device placement
     )
-    entangled_model.config.use_cache = False # Required for gradient checkpointing/training
-    # Set pretraining_tp to 1 to avoid issues with device mapping / gradient checkpointing
-    entangled_model.config.pretraining_tp = 1
+    base_model.config.use_cache = False
+    base_model.config.pretraining_tp = 1
 
     # --- PEFT Setup ---
-    # Ensure custom layers are trainable
-    entangled_model.variational_head.requires_grad_(True)
-    entangled_model.Wc_projection.requires_grad_(True)
-    # Apply LoRA adapters
-    peft_model = get_peft_model(entangled_model, lora_config)
-    peft_model.print_trainable_parameters()
+    peft_base_model = get_peft_model(base_model, lora_config)
+    peft_base_model.print_trainable_parameters()
 
+    # --- Instantiate Entangled Wrapper --- 
+    print("Creating EntangledModel wrapper (Full Forward)...") 
+    model = EntangledModel( 
+        base_model=peft_base_model, 
+        commitment_dim=commitment_dim
+    )
+    model.variational_head.requires_grad_(True)
+    model.Wc_projection.requires_grad_(True)
+    print("EntangledModel wrapper created.")
 
-    # --- Training Arguments ---
+    # --- Training Arguments (Longer run) --- 
     print("Setting up Training Arguments...")
     training_arguments = TrainingArguments(
         output_dir=output_dir,
-        num_train_epochs=1,              # Start with 1 epoch for testing
-        per_device_train_batch_size=4,   # Adjust based on GPU memory
-        gradient_accumulation_steps=1,   # Adjust based on GPU memory
-        optim="paged_adamw_32bit",       # Optimizer suitable for QLoRA
-        save_steps=50,                   # Save checkpoints periodically
-        logging_steps=10,                # Log metrics periodically
-        learning_rate=2e-4,              # Common learning rate for QLoRA
+        num_train_epochs=3,              # Set epochs instead of steps for full dataset run
+        per_device_train_batch_size=1,   
+        gradient_accumulation_steps=4,   
+        optim="paged_adamw_32bit",      
+        save_strategy="epoch",           # Save checkpoints every epoch
+        logging_steps=100,               # Log every 100 steps for longer run
+        learning_rate=2e-4,
         weight_decay=0.001,
-        fp16=False,                      # Use bf16 if available (A100/H100), else fp16
-        bf16=True,                       # Set to True if using Ampere GPUs or newer
+        fp16=False,                      
+        bf16=True,                       
         max_grad_norm=0.3,
-        max_steps=10,                    # MODIFIED: Run only 10 steps for quick test
+        max_steps=-1,                    # CHANGED: Use num_train_epochs instead
         warmup_ratio=0.03,
-        group_by_length=True,            # Faster training by grouping similar length sequences
-        lr_scheduler_type="constant",    # Or "cosine"
-        report_to="tensorboard",         # Or "wandb"
-        # Additional arguments...
+        group_by_length=True,
+        lr_scheduler_type="constant",
+        # report_to="tensorboard", # Keep commented out
+        gradient_checkpointing=False,    
+        gradient_checkpointing_kwargs={"use_reentrant": False}, 
     )
 
-    # --- Initialize Trainer ---
-    print("Initializing Custom Entangled Trainer...")
-    trainer = EntangledTrainer( # Use the custom trainer
-        model=peft_model,
-        train_dataset=dataset,
-        # peft_config=lora_config, # Not needed for standard Trainer
+    # --- Initialize Standard Trainer (for setup only) --- 
+    print("Initializing Standard Trainer for setup...")
+    from transformers import default_data_collator
+    trainer = Trainer( 
+        model=model, 
+        train_dataset=tokenized_dataset, 
         args=training_arguments,
         tokenizer=tokenizer,
-        # Data collator might be needed depending on dataset format / padding
-        # data_collator=transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False),
-        kl_beta=kl_beta_value, # Pass beta hyperparameter
+        data_collator=default_data_collator,
     )
+    print("Trainer initialized for setup.")
 
-    # --- Start Training ---
-    print("Starting training...")
-    trainer.train()
+    # --- Get DataLoader FIRST --- 
+    print("Getting DataLoader...", flush=True)
+    train_dataloader = trainer.get_train_dataloader()
+    print("DataLoader obtained.", flush=True)
 
-    # --- Save Model ---
-    print("Saving final model...")
-    trainer.model.save_pretrained(output_dir)
+    # --- Create Optimizer and Scheduler manually (using DataLoader info) --- 
+    print("Creating optimizer and scheduler...", flush=True)
+    optimizer = trainer.create_optimizer()
+    # Calculate total training steps for scheduler
+    # Use max_steps directly if provided, otherwise calculate based on dataloader length
+    if training_arguments.max_steps > 0:
+        num_training_steps = training_arguments.max_steps
+    else:
+        num_update_steps_per_epoch = len(train_dataloader) // training_arguments.gradient_accumulation_steps
+        num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1) # Ensure at least 1 step
+        num_training_steps = num_update_steps_per_epoch * training_arguments.num_train_epochs
+        
+    scheduler = trainer.create_scheduler(num_training_steps=num_training_steps)
+    print(f"Optimizer and scheduler created. Num training steps for scheduler: {num_training_steps}", flush=True) # Log num_steps
+
+    # --- Manual Training Loop --- 
+    print("Starting MANUAL training loop...")
+    model.train() # Set model to training mode
+    global_step = 0
+    completed_steps = 0
+
+    # --- Use Accelerate for proper device handling and autocast --- 
+    from accelerate import Accelerator
+    accelerator = Accelerator(mixed_precision='bf16' if training_arguments.bf16 else 'fp16' if training_arguments.fp16 else 'no')
+    model, optimizer, train_dataloader, scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, scheduler
+    )
+    print("Accelerator prepared.", flush=True)
+
+    for epoch in range(int(training_arguments.num_train_epochs)):
+        print(f"--- Starting Epoch {epoch+1}/{int(training_arguments.num_train_epochs)} ---") # Keep epoch print
+        for step, batch in enumerate(train_dataloader):
+            
+            # print(f"--- Epoch {epoch+1}, Step {completed_steps+1}/{num_training_steps} --- Batch {step+1} --- ", flush=True) # Remove inner step print
+            
+            with accelerator.accumulate(model):
+                outputs = model(**batch) 
+                lm_loss = outputs.loss
+                kl_loss = outputs.kl_loss if outputs.kl_loss is not None else torch.tensor(0.0, device=accelerator.device)
+                
+                total_loss = lm_loss + kl_beta_value * kl_loss
+                
+                # Keep basic loss print 
+                print(f">>> [Global Step {global_step+1}] Loss: {total_loss.item():.4f} (LM: {lm_loss.item():.4f}, KL: {kl_loss.item():.4f})", flush=True)
+
+                accelerator.backward(total_loss)
+
+                if accelerator.sync_gradients:
+                    # print(f">>> [Step {global_step+1}] Performing gradient sync & optimizer step ...", flush=True)
+                    if training_arguments.max_grad_norm is not None:
+                         accelerator.clip_grad_norm_(model.parameters(), training_arguments.max_grad_norm)
+
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1 
+                    # print(f">>> [Step {global_step}] Optimizer step complete.", flush=True)
+            
+            completed_steps += 1
+            if training_arguments.max_steps > 0 and global_step >= training_arguments.max_steps:
+                print(f">>> Reached max_steps ({training_arguments.max_steps}). Stopping manual loop.")
+                break 
+                
+        if training_arguments.max_steps > 0 and global_step >= training_arguments.max_steps:
+            break 
+
+    print("--- Manual training loop finished ---")
+
+    # --- Save Model (Use unwrapped model if using accelerate) --- 
+    print("Saving final model components...", flush=True)
+    unwrapped_model = accelerator.unwrap_model(model)
+    # Save the LoRA adapter weights from the base model
+    unwrapped_model.base_model.save_pretrained(output_dir) 
+    # Save the custom head and projection weights
+    torch.save(unwrapped_model.variational_head.state_dict(), f"{output_dir}/variational_head.pth")
+    torch.save(unwrapped_model.Wc_projection.state_dict(), f"{output_dir}/Wc_projection.pth")
+    # Save tokenizer
     tokenizer.save_pretrained(output_dir)
+    print("Model components saved.", flush=True)
 
-    print("Phase 2 Training Script Setup Complete")
+    print(f"Phase 2 Full Training Run ({dataset_name}) Complete")
     pass
